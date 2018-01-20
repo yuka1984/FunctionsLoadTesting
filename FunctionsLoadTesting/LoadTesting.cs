@@ -33,7 +33,7 @@ namespace FunctionsLoadTesting
         {
             log.Info($"Start: {DateTime.UtcNow.ToLongDateString()}");
             dynamic eventData = await req.Content.ReadAsAsync<object>(); 
-            var instanceId = await starter.StartNewAsync("ClientOrchestrator", eventData); // eventData is not needed. However, the interface requires.
+            var instanceId = await starter.StartNewAsync("AgentExpansionOrchestrator", eventData); // eventData is not needed. However, the interface requires.
             var result = JsonConvert.SerializeObject(new JObject {["instanceId"] = instanceId});
 
             return new HttpResponseMessage()
@@ -77,6 +77,73 @@ namespace FunctionsLoadTesting
             {
                 Content = new StringContent(result, System.Text.Encoding.UTF8, "application/text")
             };
+        }
+
+        [FunctionName("AgentExpansionOrchestrator")]
+        public static async Task AgentExpansionOrchestrator(
+            [OrchestrationTrigger] DurableOrchestrationContext context
+            )
+        {
+            const int agentNumber = 1000;
+            var agentOrchestrators = Enumerable.Range(0, agentNumber)
+                .Select(x => new AgentRequest{ DeviceId = GetDeviceId(x) , PrintedMessages = Array.Empty<Message>()})
+                .Select(request => context.CallSubOrchestratorAsync("AgentOrchestrator", request))
+                ;
+
+            await Task.WhenAll(agentOrchestrators);
+        }
+
+        [FunctionName("AgentOrchestrator")]
+        public static async Task AgentOrchestrator([OrchestrationTrigger] DurableOrchestrationContext context)
+        {
+            var agentRequest = context.GetInput<AgentRequest>();
+
+            var result = await context.CallActivityAsync<Message[]>("AgentActivity", agentRequest);
+
+            agentRequest.PrintedMessages = agentRequest.PrintedMessages.Concat(result).ToArray();
+
+            context.ContinueAsNew(agentRequest);
+        }
+
+        [FunctionName("AgentActivity")]
+        public static async Task<Message[]> AgentActivity(
+            [ActivityTrigger] AgentRequest request, 
+            [Queue("que2", Connection = "connectionString")] CloudQueue queue,
+            [Table("table", Connection = "connectionString")] CloudTable table,
+            TraceWriter log)
+        {
+            var list = await GetListAsync(request.DeviceId, table);
+            var result = new List<Message>();
+
+            //// Loop through the results, displaying information about the entity.
+            foreach (Message entity in list)
+            {
+                if (request.PrintedMessages.Any(x=> x.PartitionKey == entity.PartitionKey && x.RowKey == entity.RowKey))
+                    continue;
+
+                var payloadObj = Payload.FromText(entity.Text);
+                payloadObj.InsertedIntoQ3 = DateTime.UtcNow;
+                payloadObj.InsertIntervalAll = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ1;
+                payloadObj.InsertInterval2 = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ2;
+
+                JObject returnObj = new JObject() {
+                        { "PartitionKey", entity.PartitionKey },
+                        { "RowKey", entity.RowKey },
+                        { "Text", payloadObj.ToText() },
+                    };
+                Print(entity, payloadObj);
+                result.Add(entity);
+                await EnqueueAsync(queue, returnObj.ToString());
+            }
+
+            return result.ToArray();
+        }
+
+        public class AgentRequest
+        {
+            public Message[] PrintedMessages { get; set; }
+
+            public string DeviceId { get; set; }
         }
 
         [FunctionName("ClientOrchestrator")]
