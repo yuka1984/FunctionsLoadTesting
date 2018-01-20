@@ -32,8 +32,8 @@ namespace FunctionsLoadTesting
             TraceWriter log)
         {
             log.Info($"Start: {DateTime.UtcNow.ToLongDateString()}");
-            dynamic eventData = await req.Content.ReadAsAsync<object>(); 
-            var instanceId = await starter.StartNewAsync("ClientOrchestrator", eventData); // eventData is not needed. However, the interface requires.
+            dynamic eventData = await req.Content.ReadAsAsync<object>();
+            var instanceId = await starter.StartNewAsync("ClientOrchestrator", Array.Empty<Message>());
             var result = JsonConvert.SerializeObject(new JObject {["instanceId"] = instanceId});
 
             return new HttpResponseMessage()
@@ -63,9 +63,9 @@ namespace FunctionsLoadTesting
 
         [FunctionName("ClientStatus")]
         public static async Task<HttpResponseMessage> ClientStatus(
-     [HttpTrigger] HttpRequestMessage req,
-     [OrchestrationClient] DurableOrchestrationClient client,
-     TraceWriter log)
+            [HttpTrigger] HttpRequestMessage req,
+            [OrchestrationClient] DurableOrchestrationClient client,
+            TraceWriter log)
         {
             var body = await req.Content.ReadAsStringAsync();
             var restored = JsonConvert.DeserializeObject<JObject>(body);
@@ -83,65 +83,75 @@ namespace FunctionsLoadTesting
         public static async Task ClientOrchestrator(
             [OrchestrationTrigger] DurableOrchestrationContext context)
         {
-            const int agentNumber = 10;
-            var tasks = new Task[agentNumber];
-            for (int i = 0; i < agentNumber; i++)
-            {
-                var deviceId = GetDeviceId(i);
-                tasks[i] = context.CallActivityAsync("Client", deviceId);
-            }
+            const int agentNumber = 5;
 
-            await Task.WhenAll(tasks);
+            var executedMessages = context.GetInput<Message[]>();
+
+            var tasks = Enumerable.Range(0, agentNumber)
+                .Select(number => new ClientActivityRequest{ DeviceId = GetDeviceId(number), ExecutedMessages = executedMessages})
+                .Select(request => context.CallActivityAsync<Message[]>("Client", request))
+                ;
+
+            var result = await Task.WhenAll(tasks);
+
+            context.ContinueAsNew(result.SelectMany(x => x).ToArray());
         }
 
+
+
         [FunctionName("Client")]
-        public static async Task ClientExec(
-            [ActivityTrigger] string deviceId, [Queue("que2", Connection = "connectionString")] CloudQueue queue, [Table("table", Connection = "connectionString")]CloudTable table, TraceWriter log)
+        public static async Task<Message[]> ClientExec(
+            [ActivityTrigger] ClientActivityRequest request,
+            [Queue("que2", Connection = "connectionString")] CloudQueue queue,
+            [Table("table", Connection = "connectionString")] CloudTable table,
+            TraceWriter log)
         {
             const int pollingInterval = 1;
+            var deviceId = request.DeviceId;
+            var result = new List<Message>();
 
-            log.Info($"{deviceId} has been started.");
-            var TableList = new List<string>();
             try
             {
-                while (true)
+                // check if the cancellation queue is coming.
+
+                var list = await GetListAsync(deviceId, table);
+
+                //// Loop through the results, displaying information about the entity.
+                foreach (Message entity in list)
                 {
-                    // check if the cancellation queue is coming.
+                    if (
+                        request.ExecutedMessages.Any(
+                            x => x.PartitionKey.Equals(entity.PartitionKey) && x.RowKey.Equals(entity.RowKey)))
+                        continue;
 
-                    var list = await GetListAsync(deviceId, table);
+                    var payloadObj = Payload.FromText(entity.Text);
+                    payloadObj.InsertedIntoQ3 = DateTime.UtcNow;
+                    payloadObj.InsertIntervalAll = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ1;
+                    payloadObj.InsertInterval2 = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ2;
 
-                    //// Loop through the results, displaying information about the entity.
-                    foreach (Message entity in list)
+                    JObject returnObj = new JObject()
                     {
-                        if (TableList.Contains(entity.RowKey))
-                            continue;
-
-                        var payloadObj = Payload.FromText(entity.Text);
-                        payloadObj.InsertedIntoQ3 = DateTime.UtcNow;
-                        payloadObj.InsertIntervalAll = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ1;
-                        payloadObj.InsertInterval2 = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ2;
-
-                        JObject returnObj = new JObject() {
-                        { "PartitionKey", entity.PartitionKey },
-                        { "RowKey", entity.RowKey },
-                        { "Text", payloadObj.ToText() },
+                        {"PartitionKey", entity.PartitionKey},
+                        {"RowKey", entity.RowKey},
+                        {"Text", payloadObj.ToText()},
                     };
-                        Print(entity, payloadObj);
-                        TableList.Add(entity.RowKey);
-                        await EnqueueAsync(queue, returnObj.ToString());
-                    }
-
-                    await Task.Delay(TimeSpan.FromSeconds(pollingInterval));
+                    Print(entity, payloadObj);
+                    result.Add(entity);
+                    await EnqueueAsync(queue, returnObj.ToString());
                 }
-            } catch (Exception e)
+
+            }
+            catch (Exception e)
             {
                 log.Error($"Client Error Happens. {e.Message}", e);
-            } finally
+                throw;
+            }
+            finally
             {
                 log.Info($"{deviceId} has been finished.");
             }
 
-
+            return result.ToArray();
         }
 
         public async static Task<List<Message>> GetListAsync(string partitionKey, CloudTable table)
@@ -230,5 +240,12 @@ namespace FunctionsLoadTesting
             Console.WriteLine($"{partitionKey} {payload.InsertedIntoQ1.ToLongTimeString()} {message.RowKey}");
             return new CloudQueueMessage(messageText);
         }
+    }
+
+    public class ClientActivityRequest
+    {
+        public Message[] ExecutedMessages { get; set; }
+
+        public string DeviceId { get; set; }
     }
 }
